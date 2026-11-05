@@ -1,0 +1,163 @@
+name: publish the release note
+
+# Publishing a GitHub Release was in no document and in no workflow, and three
+# consecutive releases shipped without one (#386) — the run that measured it
+# was the one that would have made it four.
+#
+# The tag gets done every time, because something reads it:
+# `hooks/version-check.py` asks `git ls-remote --tags`, and an untagged release
+# is one no installed session is ever told about. The note had no reader in the
+# tree at all, so nothing noticed its absence and the only cost was borne by a
+# person opening the releases page.
+#
+# So the release's merge into `main` tags it and publishes it, in one run
+# (#1117). A tag this workflow creates with its own token starts no workflow
+# of its own, so the tag, the note and the seal cannot be three runs. The
+# first step, `.github/scripts/tag_release.py`, creates the `vX.Y.Z` tag on
+# the pushed commit where the push moved `plugin.json`'s version, and passes
+# it on; every other push to `main` passes on no tag, and nothing after it
+# runs. A tag pushed by hand fires the workflow too and is passed on as it
+# is. The note is built from the changelog fragments the release's commits
+# added and the previous version tag does not already hold, read from the
+# history at the tag (`.github/scripts/publish_release_note.py`'s docstring
+# says how).
+#
+# Then the seal (#718). A second job, `seal`, runs only when `publish` created
+# the release in this run (`created` is its output; a re-pushed tag or a full
+# re-run finds a release already there and writes `false`, and a re-run of
+# `seal` alone keeps `true` and meets the header guard instead: the first
+# run replaced the header, so the second finds none to replace). It runs the
+# suite at the tag and replaces the note's header with a table of the
+# stamp's results as badges, each with its result as alt text (#1153,
+# #1299, `.github/scripts/release_seal.py`). Where
+# `seal/config.md`'s `Release note seal mark` row reads `yes` at the tag
+# (#1204), it first attaches the page form of the stamp's mark, the PNG
+# `.claude-plugin/plugin.json` names as its `icon` (#857), as `seal.png`, and
+# the table opens with the image beside the results; under any other value
+# nothing is attached and a value other than `yes` is named. Every
+# step of it is `continue-on-error`, and every failure the script meets is a
+# log line and a `::warning::` with an exit of 0: the note is already out,
+# and a seal that cannot be drawn costs the image and never the counts. So
+# nothing in that job can turn the workflow red or touch a note this run did
+# not write.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# The first write of this scope in the repository, and the minimum
+# `gh release create` and a tag created through the API need. The workflow
+# writes four things under it: one tag and one release (`publish`), one asset
+# on that release and one edit of its note (`seal`). `gh pr list` reads the pull requests' labels and head branches
+# under the same block, which is a read.
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Whether this run created the release, which is the only release the
+    # `seal` job may edit (`publish_release_note.py#write_output`), and the
+    # tag it was published for: the ref's name is `main` on the push to
+    # `main`, so the tag is read from the tag step alone.
+    outputs:
+      created: ${{ steps.note.outputs.created }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history and every tag: the tag step reads `plugin.json`
+          # at the push's earlier commit and the tags that already exist, the
+          # note reads the fragments the commits after the previous version
+          # tag added and that tag does not already hold, and the title from
+          # the tagged commit's message, so `git log -1 <tag>` resolves the
+          # tag itself rather than whatever the runner happened to check out.
+          fetch-depth: 0
+
+      - name: tag the release where this push moved the version
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: python3 .github/scripts/tag_release.py
+
+      - name: publish the GitHub Release for this tag
+        id: note
+        if: steps.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: python3 .github/scripts/publish_release_note.py
+
+  seal:
+    needs: publish
+    if: needs.publish.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    # A hung suite must end as a failed step, not as a job the runner ends at
+    # its six-hour default: a step's `continue-on-error` does not reach the
+    # job's own timeout, and the job's line below keeps the run green if it
+    # is reached anyway.
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      # Not shallow, for `test.yml`'s reason: a case resolves a commit
+      # the records name, and at depth 1 the commit is missing.
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          fetch-depth: 0
+          # The tag `publish` published for, which the suite runs at.
+          ref: ${{ needs.publish.outputs.tag }}
+          # Nothing in this job pushes: the draw reaches GitHub through `gh`
+          # and `GH_TOKEN`. So the token is not left in `.git/config`, where
+          # every process of the suite at the tag could read it.
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        continue-on-error: true
+        with:
+          python-version: '3.12'
+      # The suite's packages, at the versions
+      # `.github/scripts/run_tests.py` pins; a case holds this line to them.
+      # cmarkgfm is among them since #647: the table walker's case imports it.
+      - name: install the suite's packages
+        continue-on-error: true
+        run: pip install pytest pytest-xdist markdown-it-py==4.2.0 cmarkgfm==2025.10.22
+      # `test.yml`'s ubuntu leg, with the broad gate's recorder loaded as the
+      # gate loads it (`broad_gate.recording_env`): its directory on
+      # `PYTHONPATH`, `-p` in `PYTEST_ADDOPTS`, the directory it writes in and
+      # a key this run chooses. The draw reads the counts from that record
+      # through the gate's own reader (#869). No token is in this step's
+      # environment, and the checkout left none in `.git/config`.
+      - name: run the suite at the tag
+        id: suite
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/skills/verify/scripts/pytest_record
+          PYTEST_ADDOPTS: -p agentic_pytest_record
+          AGENTIC_RECORD_DIR: ${{ runner.temp }}/records
+          AGENTIC_RECORD_KEY: seal-${{ github.run_id }}
+        run: |
+          git config --global user.email ci@ci
+          git config --global user.name ci
+          mkdir -p "$AGENTIC_RECORD_DIR"
+          pytest tests/ -q -n auto
+      - name: draw the seal and put it in the note
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.publish.outputs.tag }}
+          REPO: ${{ github.repository }}
+          SUITE_RECORDS: ${{ runner.temp }}/records
+          SUITE_KEY: seal-${{ github.run_id }}
+          SUITE_OUTCOME: ${{ steps.suite.outcome }}
+        shell: bash
+        run: python3 .github/scripts/release_seal.py
